@@ -1,5 +1,6 @@
 #%%
 
+from math import e
 from tqdm import tqdm
 import os
 import json
@@ -38,7 +39,6 @@ df = pd.DataFrame(
         "id": [x[0] for x in data_],
         "username": [x[1] for x in data_],
         "guess": [x[2] for x in data_],
-        "correct_answer": [x[3] for x in data_],
         "guessed_token_idx": [x[4] for x in data_],
         "doc_id": [x[5] for x in data_],
         "doc_tokens": [docs[x[5]] for x in data_],
@@ -56,23 +56,47 @@ cleaned_df = df[
 ]
 
 
-def f(row):
+def get_correct(row):
     if row["guessed_token_idx"] > len(row["doc_tokens"]):
         print("invalid doc")
         return ""
     else:
         return row["doc_tokens"][row["guessed_token_idx"] - 1]
 
+def get_next_correct(row):
+    if row["guessed_token_idx"] >= len(row["doc_tokens"]):
+        return ""
+    else:
+        return row["doc_tokens"][row["guessed_token_idx"]]
 
-cleaned_df["correct_guess"] = cleaned_df.apply(func=f, axis=1)
-cleaned_df = cleaned_df[cleaned_df["correct_guess"].str.contains("\n") == False]
 
+cleaned_df["correct_guess"] = cleaned_df.apply(func=get_correct, axis=1)
+cleaned_df["next_correct_guess"] = cleaned_df.apply(func=get_next_correct, axis=1)
+
+initial_filter = True
+if initial_filter:
+    cleaned_df = cleaned_df[cleaned_df["correct_guess"].str.contains("\n") == False]
+else:
+    # new filter is only keeps full words: space then letters (no digit), and next tok start with space
+    def filter_guess(row):
+        this_correct = row["correct_guess"]
+        next_correct = row["next_correct_guess"]
+        
+        if len(this_correct) < 2 or len(next_correct) < 1:
+            return False
+        
+        return this_correct[0] == " " and this_correct[1:].isalpha() and next_correct[0] == " "
+    
+    cleaned_df = cleaned_df[cleaned_df.apply(func=filter_guess, axis=1)]
+        
 
 def f(row):
     return "".join(row["doc_tokens"][: row["guessed_token_idx"] - 1])
 
 
 cleaned_df["prompt"] = cleaned_df.apply(func=f, axis=1)
+
+print(len(cleaned_df)) # 23403 with initial filter, 14442 with new filter
 # %%
 good_answers = cleaned_df[cleaned_df["correct_guess"] == cleaned_df["guess"]]
 bad_answers = cleaned_df[cleaned_df["correct_guess"] == cleaned_df["guess"]]
@@ -93,57 +117,77 @@ for user in large_users_df["username"].unique():
     print(user, good, total, f"{good/total:.2f}")
     accuracies.append(good / total)
 #%%
-run_accuracy = False
+import asyncio
+import os
+import openai
+import pandas as pd
+import json
+from functools import lru_cache
+import nest_asyncio
+
+nest_asyncio.apply()
+
+run_accuracy = True
 if run_accuracy:
-    import openai
-    from functools import lru_cache
+    # OAI = (os.getenv("OPENAI_API_KEY"), "https://api.openai.com/v1")
+    GAI = (os.getenv("GOOSE_API_KEY"), "https://api.goose.ai/v1")
+    # engines = {"fairseq-13b": GAI, "fairseq-1-3b": GAI, "fairseq-125m": GAI}
+    # use gpt-neo models
+    engines = {
+        "gpt-neo-125m": GAI,
+        "gpt-neo-1-3b": GAI,
+        "gpt-neo-2-7b": GAI,
+        "gpt-j-6b": GAI,
+    }
 
-    OAI = (os.getenv("OPENAI_API_KEY"), "https://api.openai.com/v1")
-    # GAI = (os.getenv("GOOSE_API_KEY"), "https://api.goose.ai/v1")
-    # engines = {"davinci": OAI, "fairseq-13b": GAI, "fairseq-1-3b": GAI, "fairseq-125m": GAI}
-    engines = {"davinci": OAI, "babbage": OAI, "curie": OAI, "ada": OAI}
-
-    def get_prediction_on(prompt, engine):
+    async def get_prediction_on(prompt, engine):
         openai.api_key, openai.api_base = engines[engine]
-        completion = openai.Completion.create(
-            engine=engine,
-            prompt=prompt,
-            max_tokens=1,
-            temperature=0.0,
-            stream=False,
-        )
+        try:
+            completion = await openai.Completion.acreate(
+                engine=engine,
+                prompt=prompt,
+                max_tokens=1,
+                temperature=0.0,
+                stream=False,
+            )
+        except Exception as e:
+            await asyncio.sleep(5)
+            print(e)
+            return get_prediction_on(prompt, engine)
         return completion.choices[0].text
 
-    @lru_cache(maxsize=None)
-    def get_prediction(prompt):
-        return {engine: get_prediction_on(prompt, engine) for engine in engines.keys()}
-
-    from random import randint
+    async def get_prediction(prompt):
+        return {engine: await get_prediction_on(prompt, engine) for engine in engines.keys()}
 
     c = 0
 
-    def get_model_preds(row):
+    async def get_model_preds(row):
         global c
         c += 1
         if c % 10 == 0:
             print(c, end=" ")
-        r = get_prediction(row["prompt"])
+        r = await get_prediction(row["prompt"])
         return pd.Series(list(r.values()))
 
-    small_cleaned_df = cleaned_df.sample(1000, random_state=0)
-    small_cleaned_df[list(engines.keys())] = small_cleaned_df.apply(func=get_model_preds, axis=1)
+    async def main():
+        small_cleaned_df = cleaned_df.sample(1000, random_state=0)
+        tasks = [get_model_preds(row) for _, row in small_cleaned_df.iterrows()]
+        results = await asyncio.gather(*tasks)
+        small_cleaned_df[list(engines.keys())] = results
 
-    models_perf = {}
-    for engine in engines.keys():
-        good_answers = small_cleaned_df[small_cleaned_df["correct_guess"] == small_cleaned_df[engine]]
-        bad_answers = small_cleaned_df[small_cleaned_df["correct_guess"] == small_cleaned_df[engine]]
-        accuracy = good_answers.shape[0] / small_cleaned_df.shape[0]
-        print(engine, accuracy)
-        models_perf[engine] = accuracy
+        models_perf = {}
+        for engine in engines.keys():
+            good_answers = small_cleaned_df[small_cleaned_df["correct_guess"] == small_cleaned_df[engine]]
+            bad_answers = small_cleaned_df[small_cleaned_df["correct_guess"] != small_cleaned_df[engine]]
+            accuracy = good_answers.shape[0] / small_cleaned_df.shape[0]
+            print(engine, accuracy)
+            models_perf[engine] = accuracy
 
-    json.dump(models_perf, open("results_raw/model_perfs.json", "w"))
-else:
-    models_perf = json.load(open("results_raw/model_perfs.json", "r"))
+        json.dump(models_perf, open("results_raw/model_perfs_new_new_new.json", "w"))
+
+    asyncio.run(main())
+    
+models_perf = json.load(open("results_raw/model_perfs_new_new_new.json", "r"))
 #%%
 import matplotlib.pyplot as plt
 import numpy as np
@@ -156,10 +200,19 @@ plt.title("players vs LM accuracy")
 plt.hist(accuracies, bins=np.arange(0, 0.60 + 1e-10, 0.02), label="human performance distribution")
 
 displayed_names = {
-    "davinci": "GPT-3",
-    "curie": "curie",
-    "babbage": "babbage",
-    "ada": "ada",
+    # "davinci": "GPT-3",
+    # "curie": "curie",
+    # "babbage": "babbage",
+    # "ada": "ada",
+    # "davinci-002": "Davinci v2",
+    # "babbage-002": "Babbage v2",
+    # "fairseq-13b": "fairseq-13b",
+    # "fairseq-1-3b": "fairseq-1.3b",
+    # "fairseq-125m": "fairseq-125m",
+    "gpt-neo-125m": "gpt-neo-125m",
+    "gpt-neo-1-3b": "gpt-neo-1-3b",
+    "gpt-neo-2-7b": "gpt-neo-2-7b",
+    "gpt-j-6b": "gpt-j-6b"
 }
 models_perf = {displayed_names[name]: perf for name, perf in models_perf.items() if name in displayed_names}
 
