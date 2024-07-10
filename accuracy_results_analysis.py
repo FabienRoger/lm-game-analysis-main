@@ -1,4 +1,4 @@
-#%%
+# %%
 
 from math import e
 from tqdm import tqdm
@@ -29,7 +29,7 @@ docs = []
 N = 10_000
 for i in tqdm(range(N)):
     docs.append(load_doc(i))
-#%%
+# %%
 
 import pandas as pd
 
@@ -45,7 +45,7 @@ df = pd.DataFrame(
     }
 )
 df["doc_str"] = df["doc_tokens"].apply(lambda l: "".join(l))
-#%%
+# %%
 
 # Remove users that tested the app and the "anon" username
 cleaned_df = df[
@@ -63,6 +63,7 @@ def get_correct(row):
     else:
         return row["doc_tokens"][row["guessed_token_idx"] - 1]
 
+
 def get_next_correct(row):
     if row["guessed_token_idx"] >= len(row["doc_tokens"]):
         return ""
@@ -73,22 +74,27 @@ def get_next_correct(row):
 cleaned_df["correct_guess"] = cleaned_df.apply(func=get_correct, axis=1)
 cleaned_df["next_correct_guess"] = cleaned_df.apply(func=get_next_correct, axis=1)
 
+print(len(cleaned_df))  # 24175
+
 initial_filter = True
 if initial_filter:
-    cleaned_df = cleaned_df[cleaned_df["correct_guess"].str.contains("\n") == False]
+    def filter_guess(row):
+        return "\n" not in row["correct_guess"] and "�" not in row["correct_guess"] and row["correct_guess"] != ""
+    
+    cleaned_df = cleaned_df[cleaned_df.apply(func=filter_guess, axis=1)]
 else:
     # new filter is only keeps full words: space then letters (no digit), and next tok start with space
     def filter_guess(row):
         this_correct = row["correct_guess"]
         next_correct = row["next_correct_guess"]
-        
+
         if len(this_correct) < 2 or len(next_correct) < 1:
             return False
-        
+
         return this_correct[0] == " " and this_correct[1:].isalpha() and next_correct[0] == " "
-    
+
     cleaned_df = cleaned_df[cleaned_df.apply(func=filter_guess, axis=1)]
-        
+
 
 def f(row):
     return "".join(row["doc_tokens"][: row["guessed_token_idx"] - 1])
@@ -96,13 +102,13 @@ def f(row):
 
 cleaned_df["prompt"] = cleaned_df.apply(func=f, axis=1)
 
-print(len(cleaned_df)) # 23403 with initial filter, 14442 with new filter
+print(len(cleaned_df))  # 22642 with initial filter, 14442 with new filter
 # %%
 good_answers = cleaned_df[cleaned_df["correct_guess"] == cleaned_df["guess"]]
 bad_answers = cleaned_df[cleaned_df["correct_guess"] == cleaned_df["guess"]]
 accuracy = good_answers.shape[0] / cleaned_df.shape[0]
 print(accuracy)
-#%%
+# %%
 users_counts = cleaned_df.groupby(["username"])["username"].count()
 good_users = list(users_counts[users_counts > 50].index.values)
 large_users_df = cleaned_df[cleaned_df["username"].isin(good_users)]
@@ -116,7 +122,7 @@ for user in large_users_df["username"].unique():
     total = large_users_df[large_users_df["username"] == user].shape[0]
     print(user, good, total, f"{good/total:.2f}")
     accuracies.append(good / total)
-#%%
+# %%
 import asyncio
 import os
 import openai
@@ -127,7 +133,9 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
-run_accuracy = True
+suffix = "_orig" if initial_filter else ""
+
+run_accuracy = False
 if run_accuracy:
     # OAI = (os.getenv("OPENAI_API_KEY"), "https://api.openai.com/v1")
     GAI = (os.getenv("GOOSE_API_KEY"), "https://api.goose.ai/v1")
@@ -183,21 +191,21 @@ if run_accuracy:
             print(engine, accuracy)
             models_perf[engine] = accuracy
 
-        json.dump(models_perf, open("results_raw/model_perfs_new_new_new.json", "w"))
+        json.dump(models_perf, open(f"results_raw/model_perfs_new_new_new{suffix}.json", "w"))
 
     asyncio.run(main())
-    
-models_perf = json.load(open("results_raw/model_perfs_new_new_new.json", "r"))
-#%%
+
+models_perf = json.load(open(f"results_raw/model_perfs_new_new_new{suffix}.json", "r"))
+del models_perf["gpt-neo-2-7b"]
+# %%
 import matplotlib.pyplot as plt
 import numpy as np
 
-fig, ax = plt.subplots(figsize=(10, 5))
+fig, ax = plt.subplots(figsize=(10, 4))
 
-plt.xlabel("top-1 accuracy")
-plt.ylabel("number of players")
-plt.title("players vs LM accuracy")
-plt.hist(accuracies, bins=np.arange(0, 0.60 + 1e-10, 0.02), label="human performance distribution")
+plt.xlabel("Top-1 accuracy (%)")
+plt.ylabel("Number of human players")
+plt.hist(np.array(accuracies) * 100, bins=np.arange(0, 60 + 1e-10, 2), label="human performance")
 
 displayed_names = {
     # "davinci": "GPT-3",
@@ -209,31 +217,23 @@ displayed_names = {
     # "fairseq-13b": "fairseq-13b",
     # "fairseq-1-3b": "fairseq-1.3b",
     # "fairseq-125m": "fairseq-125m",
-    "gpt-neo-125m": "gpt-neo-125m",
-    "gpt-neo-1-3b": "gpt-neo-1-3b",
-    "gpt-neo-2-7b": "gpt-neo-2-7b",
-    "gpt-j-6b": "gpt-j-6b"
+    "gpt-neo-125m": "GPT-Neo 125M",
+    "gpt-neo-1-3b": "GPT-Neo 1.3B",
+    "gpt-neo-2-7b": "GPT-Neo 2.7B",
+    "gpt-j-6b": "GPT-J (6B)",
+    "davinci": "GPT-3 (175B)",
 }
-models_perf = {displayed_names[name]: perf for name, perf in models_perf.items() if name in displayed_names}
+models_perf_d = {displayed_names[name]: perf for name, perf in models_perf.items() if name in displayed_names}
 
-for name, acc in models_perf.items():
-    plt.axvline(acc, c="red", alpha=0.5)
-    plt.text(acc - 0.012, 5, name, rotation=90, va="top")
+for name, acc in models_perf_d.items():
+    plt.axvline(acc * 100, c="red", alpha=0.9)
+    plt.text(acc * 100 + 0.5, 4 if initial_filter else 4.5, name, rotation=90, va="bottom")
 
-plt.xticks(list(np.arange(0, 0.60 + 1e-10, 0.1)))
-plt.minorticks_on()
+# minor ticks
+ax.set_xticks(np.arange(0, 60 + 1e-10, 2), minor=True)
 
 plt.legend()
-#%%
-# Accuracy per text, ordered by difficulty
-results = []
-for doc_id in cleaned_df["doc_id"].unique():
-    if cleaned_df[cleaned_df["doc_id"] == doc_id].shape[0] > 10:
-        good = good_answers[good_answers["doc_id"] == doc_id].shape[0]
-        total = cleaned_df[cleaned_df["doc_id"] == doc_id].shape[0]
-        r = (doc_id, f"{good / total:.2f}", good, total, repr("".join(docs[doc_id]))[:100], good / total)
-        results.append(r)
-results = sorted(results, key=lambda t: (t[-1]))
-for r in results:
-    print(*r)
+plt.tight_layout()
+plt.savefig(f"figures/accuracy_vs_model_perfs{suffix}.pdf")
+plt.show()
 # %%
